@@ -1,2 +1,3 @@
 trigger SaveTrace Android APK build
 retry after Android SDK workflow fix
+retry with explicit sdkmanager path
