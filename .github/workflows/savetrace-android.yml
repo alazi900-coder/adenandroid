@@ -20,6 +20,8 @@ jobs:
   build-arm64:
     runs-on: ubuntu-24.04
     timeout-minutes: 180
+    env:
+      SDKMANAGER: /usr/local/lib/android/sdk/cmdline-tools/latest/bin/sdkmanager
     steps:
       - name: Check out source
         uses: actions/checkout@v5
@@ -33,15 +35,15 @@ jobs:
       - name: Verify Android SDK
         run: |
           echo "ANDROID_HOME=$ANDROID_HOME"
-          which sdkmanager
-          sdkmanager --version
+          test -x "$SDKMANAGER"
+          "$SDKMANAGER" --version
 
       - name: Accept Android SDK licenses
-        run: yes | sdkmanager --licenses >/dev/null || true
+        run: yes | "$SDKMANAGER" --licenses >/dev/null || true
 
       - name: Install Android build packages
         run: |
-          sdkmanager --install \
+          "$SDKMANAGER" --install \
             "platforms;android-36" \
             "build-tools;36.0.0" \
             "ndk;28.2.13676358" \
