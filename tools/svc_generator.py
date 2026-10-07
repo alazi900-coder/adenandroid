@@ -528,6 +528,7 @@ PROLOGUE_CPP = """
 
 #include "core/arm/arm_interface.h"
 #include "core/core.h"
+#include "core/file_sys/save_trace.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/svc.h"
 
@@ -569,6 +570,7 @@ void Call(Core::System& system, u32 imm) {
     auto& process = GetCurrentProcess(kernel);
     std::array<uint64_t, 8> args;
     kernel.CurrentPhysicalCore().SaveSvcArguments(process, args);
+    FileSys::SaveTrace::Recorder::Instance().RecordSvc(imm, args, &system);
     LOG_TRACE(Kernel_SVC, "#{:#x} [0]={:#x} [1]={:#x} [2]={:#x} [3]={:#x} [4]={:#x} [5]={:#x} [6]={:#x}",
         imm,
         GetArg32(args, 0), GetArg32(args, 1), GetArg32(args, 2),
@@ -597,7 +599,9 @@ def emit_call(bitness, names, suffix):
     for _, name in names:
         lines.append(f"{indent}case SvcId::{name}: return SvcWrap_{name}{suffix}(system, args);")
 
-    lines.append(f"{indent}default: UNREACHABLE_MSG(\"Unhandled SVC {{:#x}}\", imm);")
+    lines.append(f"{indent}default:")
+    lines.append(f"{indent}{indent}FileSys::SaveTrace::Recorder::Instance().RecordUnhandledSvc(imm, args, &system);")
+    lines.append(f"{indent}{indent}UNREACHABLE_MSG(\"Unhandled SVC {{:#x}}\", imm);")
     lines.append(f"{indent}}}")
     lines.append("}")
 
