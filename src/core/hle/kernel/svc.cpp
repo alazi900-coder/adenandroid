@@ -10,6 +10,7 @@
 
 #include "core/arm/arm_interface.h"
 #include "core/core.h"
+#include "core/file_sys/save_trace.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/svc.h"
 
@@ -2364,7 +2365,9 @@ static void Call32(Core::System& system, u32 imm, std::span<uint64_t, 8> args) {
     case SvcId::CallSecureMonitor: return SvcWrap_CallSecureMonitor64From32(system, args);
     case SvcId::MapInsecureMemory: return SvcWrap_MapInsecureMemory64From32(system, args);
     case SvcId::UnmapInsecureMemory: return SvcWrap_UnmapInsecureMemory64From32(system, args);
-    default: UNREACHABLE_MSG("Unhandled SVC {:#x}!", imm);
+    default:
+        FileSys::SaveTrace::Recorder::Instance().RecordUnhandledSvc(imm, args, &system);
+        UNREACHABLE_MSG("Unhandled SVC {:#x}!", imm);
     }
 }
 
@@ -2493,7 +2496,9 @@ static void Call64(Core::System& system, u32 imm, std::span<uint64_t, 8> args) {
     case SvcId::CallSecureMonitor: return SvcWrap_CallSecureMonitor64(system, args);
     case SvcId::MapInsecureMemory: return SvcWrap_MapInsecureMemory64(system, args);
     case SvcId::UnmapInsecureMemory: return SvcWrap_UnmapInsecureMemory64(system, args);
-    default: UNREACHABLE_MSG("Unhandled SVC {:#x}!", imm);
+    default:
+        FileSys::SaveTrace::Recorder::Instance().RecordUnhandledSvc(imm, args, &system);
+        UNREACHABLE_MSG("Unhandled SVC {:#x}!", imm);
     }
 }
 void Call(Core::System& system, u32 imm) {
@@ -2501,6 +2506,7 @@ void Call(Core::System& system, u32 imm) {
     auto& process = GetCurrentProcess(kernel);
     std::array<uint64_t, 8> args;
     kernel.CurrentPhysicalCore().SaveSvcArguments(process, args);
+    FileSys::SaveTrace::Recorder::Instance().RecordSvc(imm, args, &system);
     //kernel.EnterSVCProfile();
     LOG_TRACE(Kernel_SVC, "{} [0]={:#x} [1]={:#x} [2]={:#x} [3]={:#x} [4]={:#x} [5]={:#x} [6]={:#x}",
         imm, GetArg64(args, 0), GetArg64(args, 1), GetArg64(args, 2),

@@ -10,6 +10,7 @@
 #include <iomanip>
 #include <mutex>
 #include <sstream>
+#include <span>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -47,7 +48,11 @@ public:
             stats = {};
             stats.state = "ARMED";
             ring.clear();
+            runtime_ring.clear();
             sequence = 0;
+            runtime_sequence = 0;
+            last_runtime_svc = 0;
+            last_runtime_reason.clear();
             session_program_id = 0;
             session_user_id_low = 0;
             session_user_id_high = 0;
@@ -57,8 +62,12 @@ public:
             std::filesystem::create_directories(dir);
             Rotate(dir / "trace.jsonl");
             Rotate(dir / "trace.txt");
+            Rotate(dir / "runtime_ring.jsonl");
+            Rotate(dir / "runtime_summary.txt");
             std::ofstream(dir / "trace.jsonl", std::ios::trunc);
             std::ofstream(dir / "trace.txt", std::ios::trunc);
+            std::ofstream(dir / "runtime_ring.jsonl", std::ios::trunc);
+            std::ofstream(dir / "runtime_summary.txt", std::ios::trunc);
         } catch (...) {
             enabled = false;
         }
@@ -69,6 +78,7 @@ public:
             std::scoped_lock lock(mutex);
             if (enabled) {
                 stats.state = "CAPTURED";
+                FlushRuntimeRingLocked("manual_stop");
                 WriteReport();
             }
             enabled = false;
@@ -185,6 +195,116 @@ public:
         }
     }
 
+    // RuntimeTrace v2: keep a bounded SVC history after SaveTrace has armed.
+    // It is intentionally observational: no registers, return values, scheduling,
+    // or guest memory are modified.
+    void RecordSvc(u32 svc_id, std::span<const u64, 8> args,
+                   Core::System* system = nullptr) noexcept {
+        if (!enabled) {
+            return;
+        }
+        try {
+            std::scoped_lock lock(mutex);
+            if (!enabled) {
+                return;
+            }
+
+            u64 guest_tid = 0;
+            u64 pc = 0;
+            u64 lr = 0;
+            if (system != nullptr) {
+                if (auto* thread = system->Kernel().GetCurrentEmuThread()) {
+                    guest_tid = thread->GetId();
+                    const auto& context = thread->GetContext();
+                    pc = context.pc;
+                    lr = context.lr;
+                }
+            }
+
+            const auto stamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            const auto host_tid = std::hash<std::thread::id>{}(std::this_thread::get_id());
+
+            std::ostringstream json;
+            json << "{\"runtime_seq\":" << ++runtime_sequence
+                 << ",\"type\":\"svc\",\"timestamp_ms\":" << stamp
+                 << ",\"svc_id\":" << svc_id
+                 << ",\"host_thread_id\":" << host_tid
+                 << ",\"guest_thread_id\":" << guest_tid
+                 << ",\"pc\":" << pc << ",\"lr\":" << lr
+                 << ",\"program_id\":\"" << std::hex << std::setw(16) << std::setfill('0')
+                 << session_program_id << std::dec << "\""
+                 << ",\"x0\":" << args[0] << ",\"x1\":" << args[1]
+                 << ",\"x2\":" << args[2] << ",\"x3\":" << args[3]
+                 << ",\"x4\":" << args[4] << ",\"x5\":" << args[5]
+                 << ",\"x6\":" << args[6] << ",\"x7\":" << args[7] << "}";
+
+            runtime_ring.push_back(json.str());
+            if (runtime_ring.size() > 512) {
+                runtime_ring.pop_front();
+            }
+            last_runtime_svc = svc_id;
+
+            // Snapshot periodically so an abrupt host-side crash still leaves a recent trail.
+            // Also snapshot immediately on guest exit/break/exception-related SVCs.
+            const bool interesting =
+                svc_id == 0x07 || svc_id == 0x0A || svc_id == 0x26 ||
+                svc_id == 0x28 || svc_id == 0x7B;
+            if (interesting || (runtime_sequence % 128) == 0) {
+                FlushRuntimeRingLocked(interesting ? "interesting_svc" : "periodic_snapshot");
+            }
+        } catch (...) {
+            // Diagnostics must never alter guest-visible behavior.
+        }
+    }
+
+    void RecordUnhandledSvc(u32 svc_id, std::span<const u64, 8> args,
+                            Core::System* system = nullptr) noexcept {
+        if (!enabled) {
+            return;
+        }
+        try {
+            std::scoped_lock lock(mutex);
+            if (!enabled) {
+                return;
+            }
+
+            u64 guest_tid = 0;
+            u64 pc = 0;
+            u64 lr = 0;
+            if (system != nullptr) {
+                if (auto* thread = system->Kernel().GetCurrentEmuThread()) {
+                    guest_tid = thread->GetId();
+                    const auto& context = thread->GetContext();
+                    pc = context.pc;
+                    lr = context.lr;
+                }
+            }
+
+            const auto stamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            std::ostringstream json;
+            json << "{\"runtime_seq\":" << ++runtime_sequence
+                 << ",\"type\":\"unhandled_svc\",\"timestamp_ms\":" << stamp
+                 << ",\"svc_id\":" << svc_id
+                 << ",\"guest_thread_id\":" << guest_tid
+                 << ",\"pc\":" << pc << ",\"lr\":" << lr
+                 << ",\"x0\":" << args[0] << ",\"x1\":" << args[1]
+                 << ",\"x2\":" << args[2] << ",\"x3\":" << args[3]
+                 << ",\"x4\":" << args[4] << ",\"x5\":" << args[5]
+                 << ",\"x6\":" << args[6] << ",\"x7\":" << args[7] << "}";
+
+            runtime_ring.push_back(json.str());
+            if (runtime_ring.size() > 512) {
+                runtime_ring.pop_front();
+            }
+            last_runtime_svc = svc_id;
+            FlushRuntimeRingLocked("unhandled_svc");
+        } catch (...) {
+            // Diagnostics must never alter guest-visible behavior.
+        }
+    }
+
 private:
     static std::string Escape(std::string_view value) {
         std::string out;
@@ -212,11 +332,45 @@ private:
         if (std::filesystem::exists(path, ec) &&
             std::filesystem::file_size(path, ec) >= 8 * 1024 * 1024) Rotate(path);
     }
+    void FlushRuntimeRingLocked(std::string_view reason) {
+        try {
+            last_runtime_reason = std::string(reason);
+            const auto dir = Directory();
+            std::filesystem::create_directories(dir);
+
+            const auto tmp = dir / "runtime_ring.jsonl.tmp";
+            {
+                std::ofstream snapshot(tmp, std::ios::trunc);
+                for (const auto& entry : runtime_ring) {
+                    snapshot << entry << '\n';
+                }
+                snapshot.flush();
+            }
+
+            std::error_code ec;
+            std::filesystem::remove(dir / "runtime_ring.jsonl", ec);
+            ec.clear();
+            std::filesystem::rename(tmp, dir / "runtime_ring.jsonl", ec);
+
+            std::ofstream summary(dir / "runtime_summary.txt", std::ios::trunc);
+            summary << "RuntimeTrace v2\n"
+                    << "reason=" << last_runtime_reason << "\n"
+                    << "svc_events=" << runtime_sequence << "\n"
+                    << "ring_entries=" << runtime_ring.size() << "\n"
+                    << "last_svc=0x" << std::hex << last_runtime_svc << std::dec << "\n";
+        } catch (...) {
+            // Diagnostics must never alter guest-visible behavior.
+        }
+    }
+
     void WriteReport() {
         std::ofstream report(Directory() / "first_divergence.txt", std::ios::trunc);
-        report << "SaveTrace v1 first divergence\n";
+        report << "SaveTrace v2 first divergence\n";
         report << "Events: " << stats.events << " Writes: " << stats.writes
                << " Bytes: " << stats.bytes << " Errors: " << stats.errors << "\n";
+        report << "Runtime SVC events: " << runtime_sequence
+               << " Last SVC: 0x" << std::hex << last_runtime_svc << std::dec
+               << " Snapshot reason: " << last_runtime_reason << "\n";
         if (!first_error.empty()) {
             report << "First observed nonzero result:\n" << first_error << "\n";
         } else if (host_writes < stats.writes) {
@@ -232,13 +386,17 @@ private:
     std::atomic_bool auto_trigger{true};
     std::atomic_bool deep_mode{};
     u64 sequence{};
+    u64 runtime_sequence{};
+    u32 last_runtime_svc{};
     u64 session_program_id{};
     u64 session_user_id_low{};
     u64 session_user_id_high{};
     u64 host_writes{};
     std::string first_error;
+    std::string last_runtime_reason;
     Snapshot stats;
     std::deque<std::string> ring;
+    std::deque<std::string> runtime_ring;
 };
 
 } // namespace FileSys::SaveTrace
