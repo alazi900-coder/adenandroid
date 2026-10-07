@@ -32,6 +32,12 @@ jobs:
           distribution: temurin
           java-version: '17'
 
+      - name: Install host build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y glslang-tools
+          glslangValidator --version
+
       - name: Verify Android SDK
         run: |
           echo "ANDROID_HOME=$ANDROID_HOME"
